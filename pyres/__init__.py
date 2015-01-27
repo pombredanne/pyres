@@ -1,18 +1,51 @@
-__version__ = '1.0'
+__version__ = '1.5'
 
 from redis import Redis
+from pyres.compat import string_types
 import pyres.json_parser as json
 
+import os
 import time, datetime
 import sys
 import logging
 
-def setup_logging(log_level=logging.INFO, filename=None, stream=sys.stderr):
-    if log_level == logging.NOTSET:
-        return
-    logger = logging.getLogger()
-    logger.setLevel(log_level)
-    if filename:
+logger = logging.getLogger(__name__)
+
+def special_log_file(filename):
+    if filename in ("stderr", "stdout"):
+        return True
+    if filename.startswith("syslog"):
+        return True
+    return False
+
+def get_logging_handler(filename, procname, namespace=None):
+    if namespace:
+        message_format = namespace + ': %(message)s'
+    else:
+        message_format = '%(message)s'
+    format = '%(asctime)s %(process)5d %(levelname)-8s ' + message_format
+
+    if not filename:
+        filename = "stderr"
+    if filename == "stderr":
+        handler = logging.StreamHandler(sys.stderr)
+    elif filename == "stdout":
+        handler = logging.StreamHandler(sys.stdout)
+    elif filename.startswith("syslog"): # "syslog:local0"
+        from logging.handlers import SysLogHandler
+        facility_name = filename[7:] or 'user'
+        facility = SysLogHandler.facility_names[facility_name]
+
+        if os.path.exists("/dev/log"):
+            syslog_path = "/dev/log"
+        elif os.path.exists("/var/run/syslog"):
+            syslog_path = "/var/run/syslog"
+        else:
+            raise Exception("Unable to figure out the syslog socket path")
+
+        handler = SysLogHandler(syslog_path, facility)
+        format = procname + "[%(process)d]: " + message_format
+    else:
         try:
             from logging.handlers import WatchedFileHandler
             handler = WatchedFileHandler(filename)
@@ -20,11 +53,26 @@ def setup_logging(log_level=logging.INFO, filename=None, stream=sys.stderr):
             from logging.handlers import RotatingFileHandler
             handler = RotatingFileHandler(filename,maxBytes=52428800,
                                           backupCount=7)
-    else:
-        handler = logging.StreamHandler(stream)
-    handler.setFormatter(logging.Formatter(
-        '%(asctime)s %(levelname)-8s %(message)s', '%Y-%m-%d %H:%M:%S'))
+    handler.setFormatter(logging.Formatter(format, '%Y-%m-%d %H:%M:%S'))
+    return handler
+
+def setup_logging(procname, log_level=logging.INFO, filename=None):
+    if log_level == logging.NOTSET:
+        return
+    main_package = __name__.split('.', 1)[0] if '.' in __name__ else __name__
+    logger = logging.getLogger(main_package)
+    logger.setLevel(log_level)
+    handler = get_logging_handler(filename, procname)
     logger.addHandler(handler)
+
+def setup_pidfile(path):
+    if not path:
+        return
+    dirname = os.path.dirname(path)
+    if dirname and not os.path.exists(dirname):
+        os.makedirs(dirname)
+    with open(path, 'w') as f:
+        f.write(str(os.getpid()))
 
 def my_import(name):
     """Helper function for walking import calls when searching for classes by
@@ -69,17 +117,9 @@ class ResQ(object):
 
     The ``__init__`` takes these keyword arguments:
 
-        ``server`` -- IP address and port of the Redis server to which you want to connect. Default is `localhost:6379`.
+        ``server`` -- IP address and port of the Redis server to which you want to connect, and optional Redis DB number. Default is `localhost:6379`.
 
         ``password`` -- The password, if required, of your Redis server. Default is "None".
-
-        ``timeout`` -- The timeout keyword is in the signature, but is unused. Default is "None".
-
-        ``retry_connection`` -- This keyword is in the signature but is deprecated. Default is "True".
-
-
-    Both ``timeout`` and ``retry_connection`` will be removed as the python-redis client
-    no longer uses them.
 
     Example usage::
 
@@ -96,22 +136,24 @@ class ResQ(object):
 
     """
     def __init__(self, server="localhost:6379", password=None):
+        self.password = password
         self.redis = server
-        if password:
-            self.redis.auth(password)
         self._watched_queues = set()
 
     def push(self, queue, item):
         self.watch_queue(queue)
         self.redis.rpush("resque:queue:%s" % queue, ResQ.encode(item))
 
-    def pop(self, queue, timeout=10):
-        ret = self.redis.blpop("resque:queue:%s" % queue, timeout=timeout)
+    def pop(self, queues, timeout=10):
+        if isinstance(queues, string_types):
+            queues = [queues]
+        ret = self.redis.blpop(["resque:queue:%s" % q for q in queues],
+                               timeout=timeout)
         if ret:
-            if isinstance(ret, tuple):
-                q, ret = ret
-            return ResQ.decode(ret)
-        return ret
+            key, ret = ret
+            return key[13:].decode(), ResQ.decode(ret)  # trim "resque:queue:"
+        else:
+            return None, None
 
     def size(self, queue):
         return int(self.redis.llen("resque:queue:%s" % queue))
@@ -137,12 +179,22 @@ class ResQ(object):
         return self._redis
 
     def _set_redis(self, server):
-        if isinstance(server, basestring):
+        if isinstance(server, string_types):
             self.dsn = server
-            host, port = server.split(':')
-            self._redis = Redis(host=host, port=int(port))
+            address, _, db = server.partition('/')
+            host, port = address.split(':')
+            self._redis = Redis(host=host, port=int(port), db=int(db or 0), password=self.password)
+            self.host = host
+            self.port = int(port)
         elif isinstance(server, Redis):
-            self.dsn = '%s:%s' % (server.host,server.port)
+            if hasattr(server, "host"):
+                self.host = server.host
+                self.port = server.port
+            else:
+                connection = server.connection_pool.get_connection('_')
+                self.host = connection.host
+                self.port = connection.port
+            self.dsn = '%s:%s' % (self.host, self.port)
             self._redis = server
         else:
             raise Exception("I don't know what to do with %s" % str(server))
@@ -156,28 +208,26 @@ class ResQ(object):
         queue = getattr(klass,'queue', None)
         if queue:
             class_name = '%s.%s' % (klass.__module__, klass.__name__)
-            self.push(queue, {'class':class_name,'args':args})
-            logging.info("enqueued '%s' job" % class_name)
-            if args:
-                logging.debug("job arguments: %s" % str(args))
-            else:
-                logging.debug("no arguments passed in.")
+            self.enqueue_from_string(class_name, queue, *args)
         else:
-            logging.warning("unable to enqueue job with class %s" % str(klass))
+            logger.warning("unable to enqueue job with class %s" % str(klass))
 
     def enqueue_from_string(self, klass_as_string, queue, *args, **kwargs):
-        payload = {'class':klass_as_string, 'queue': queue, 'args':args}
+        payload = {'class':klass_as_string, 'args':args, 'enqueue_timestamp': time.time()}
         if 'first_attempt' in kwargs:
             payload['first_attempt'] = kwargs['first_attempt']
         self.push(queue, payload)
-        logging.info("enqueued '%s' job" % klass_as_string)
+        logger.info("enqueued '%s' job on queue %s" % (klass_as_string, queue))
         if args:
-            logging.debug("job arguments: %s" % str(args))
+            logger.debug("job arguments: %s" % str(args))
         else:
-            logging.debug("no arguments passed in.")
+            logger.debug("no arguments passed in.")
 
     def queues(self):
-        return self.redis.smembers("resque:queues") or []
+        return [sm.decode() for sm in self.redis.smembers("resque:queues")] or []
+
+    def workers(self):
+        return [w.decode() for w in self.redis.smembers("resque:workers")] or []
 
     def info(self):
         """Returns a dictionary of the current status of the pending jobs,
@@ -194,23 +244,19 @@ class ResQ(object):
             'workers'   : len(self.workers()),
             #'working'   : len(self.working()),
             'failed'    : Stat('failed',self).get(),
-            'servers'   : ['%s:%s' % (self.redis.host, self.redis.port)]
+            'servers'   : ['%s:%s' % (self.host, self.port)]
         }
 
     def keys(self):
-        return [key.replace('resque:','')
+        return [key.decode().replace('resque:','')
                 for key in self.redis.keys('resque:*')]
 
-    def reserve(self, queue):
+    def reserve(self, queues):
         from pyres.job import Job
-        return Job.reserve(queue, self)
+        return Job.reserve(queues, self)
 
     def __str__(self):
-        return "PyRes Client connected to %s" % self.redis.server
-
-    def workers(self):
-        from pyres.worker import Worker
-        return Worker.all(self)
+        return "PyRes Client connected to %s" % self.dsn
 
     def working(self):
         from pyres.worker import Worker
@@ -226,15 +272,18 @@ class ResQ(object):
         """Close the underlying redis connection.
 
         """
-        self.redis.disconnect()
+        self.redis.connection_pool.get_connection('_').disconnect()
 
     def enqueue_at(self, datetime, klass, *args, **kwargs):
         class_name = '%s.%s' % (klass.__module__, klass.__name__)
-        logging.info("enqueued '%s' job for execution at %s" % (class_name,
-                                                                datetime))
+        self.enqueue_at_from_string(datetime, class_name, klass.queue, *args, **kwargs)
+
+    def enqueue_at_from_string(self, datetime, klass_as_string, queue, *args, **kwargs):
+        logger.info("scheduled '%s' job on queue %s for execution at %s" %
+                     (klass_as_string, queue, datetime))
         if args:
-            logging.debug("job arguments are: %s" % str(args))
-        payload = {'class':class_name, 'queue': klass.queue, 'args':args}
+            logger.debug("job arguments are: %s" % str(args))
+        payload = {'class': klass_as_string, 'queue': queue, 'args': args}
         if 'first_attempt' in kwargs:
             payload['first_attempt'] = kwargs['first_attempt']
         self.delayed_push(datetime, payload)
@@ -255,7 +304,7 @@ class ResQ(object):
         size = 0
         length = self.redis.zcard('resque:delayed_queue_schedule')
         for i in self.redis.zrange('resque:delayed_queue_schedule',0,length):
-            size += self.delayed_timestamp_size(i)
+            size += self.delayed_timestamp_size(i.decode())
         return size
 
     def delayed_timestamp_size(self, timestamp):
@@ -265,11 +314,13 @@ class ResQ(object):
     def next_delayed_timestamp(self):
         key = int(time.mktime(ResQ._current_time().timetuple()))
         array = self.redis.zrangebyscore('resque:delayed_queue_schedule',
-                                         '-inf', key)
+                                         '-inf', key, start=0, num=1)
         timestamp = None
         if array:
             timestamp = array[0]
-        return timestamp
+
+        if timestamp:
+            return timestamp.decode()
 
     def next_item_for_timestamp(self, timestamp):
         #key = int(time.mktime(timestamp.timetuple()))
@@ -289,10 +340,10 @@ class ResQ(object):
 
     @classmethod
     def decode(cls, item):
-        if isinstance(item, basestring):
-            ret = json.loads(item)
-            return ret
-        return None
+        if not isinstance(item, string_types):
+            item = item.decode()
+        ret = json.loads(item)
+        return ret
 
     @classmethod
     def _enqueue(cls, klass, *args):
@@ -300,7 +351,8 @@ class ResQ(object):
         _self = cls()
         if queue:
             class_name = '%s.%s' % (klass.__module__, klass.__name__)
-            _self.push(queue, {'class':class_name,'args':args})
+            _self.push(queue, {'class':class_name,'args':args,
+                               'enqueue_timestamp': time.time()})
 
     @staticmethod
     def _current_time():

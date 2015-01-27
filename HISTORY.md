@@ -1,3 +1,37 @@
+##1.4.2 (2013-06-21)
+* __str__ returns correctly with dsn
+* worker_pids returns correct set of workers
+* workers are re-registered on every job
+* add exception metadata for after_perform method
+* logger no longer overrides root logger
+* support for redis db in dsn
+
+##1.4.1 (2012-07-30)
+* fix for non existent system signal for linux
+* cleanup of setup.py and requirements
+
+##1.4 (2012-06-?)
+* added hooks for before and after perform methods
+* fixed logging
+*fixed problems with password authentication
+
+##1.3 (2012-06-01)
+* remove resweb from pyres
+* resweb is now available at http://github.com/Pyres/resweb or on pypi
+
+##1.2
+* release with changes from pull requests
+
+##1.1 (2011-06-16)
+* api change based on redis-py
+* setproctitle requirements fix
+* change exception logging in worker
+
+##1.0.1 (2011-04-12)
+* fixed bug with tempaltes and media in resweb
+* call to redis-py disconnect was failing, switched to connection.disconnect
+* interval cast to int for pyres_worker script command
+
 ## 0.9.1 (2010-10-15)
 * fixing issues #45, #46.
 	* #45 - resweb not working in chrome

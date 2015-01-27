@@ -2,7 +2,8 @@ import signal
 import time
 import logging
 
-from pyres import ResQ
+from pyres import ResQ, __version__
+from pyres.compat import string_types
 
 logger = logging.getLogger(__name__)
 
@@ -14,7 +15,7 @@ class Scheduler(object):
         >>> scheduler = Scheduler('localhost:6379')
         """
         self._shutdown = False
-        if isinstance(server, basestring):
+        if isinstance(server, string_types):
             self.resq = ResQ(server=server, password=password)
         elif isinstance(server, ResQ):
             self.resq = server
@@ -32,6 +33,7 @@ class Scheduler(object):
         self._shutdown = True
 
     def __call__(self):
+        _setproctitle("Starting")
         logger.info('starting up')
         self.register_signal_handlers()
         #self.load_schedule()
@@ -40,6 +42,7 @@ class Scheduler(object):
             if self._shutdown:
                 break
             self.handle_delayed_items()
+            _setproctitle("Waiting")
             logger.debug('sleeping')
             time.sleep(5)
         logger.info('shutting down complete')
@@ -63,7 +66,8 @@ class Scheduler(object):
 
     def handle_delayed_items(self):
         for timestamp in self.next_timestamp():
-            logger.info('handling timestamp: %s' % timestamp)
+            _setproctitle('Handling timestamp %s' % timestamp)
+            logger.debug('handling timestamp: %s' % timestamp)
             for item in self.next_item(timestamp):
                 logger.debug('queueing item %s' % item)
                 klass = item['class']
@@ -81,3 +85,11 @@ class Scheduler(object):
         sched()
 
 
+try:
+    from setproctitle import setproctitle
+except ImportError:
+    def setproctitle(name):
+        pass
+
+def _setproctitle(msg):
+    setproctitle("pyres_scheduler-%s: %s" % (__version__, msg))

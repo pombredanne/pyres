@@ -2,13 +2,14 @@ import logging
 import signal
 import datetime, time
 import os, sys
-import json_parser as json
-import commands
+from pyres import json_parser as json
+from pyres.compat import commands
+import random
 
-from pyres.exceptions import NoQueueError
+from pyres.exceptions import NoQueueError, JobError, TimeoutError, CrashError
 from pyres.job import Job
 from pyres import ResQ, Stat, __version__
-
+from pyres.compat import string_types
 
 
 logger = logging.getLogger(__name__)
@@ -18,21 +19,22 @@ class Worker(object):
     class and passes a comma-separated list of queues to listen on.::
 
        >>> from pyres.worker import Worker
-       >>> Worker.run([queue1, queue2], server="localhost:6379")
+       >>> Worker.run([queue1, queue2], server="localhost:6379/0")
 
     """
-    
+
     job_class = Job
-    
-    def __init__(self, queues=(), server="localhost:6379", password=None):
+
+    def __init__(self, queues=(), server="localhost:6379", password=None, timeout=None):
         self.queues = queues
         self.validate_queues()
         self._shutdown = False
         self.child = None
         self.pid = os.getpid()
         self.hostname = os.uname()[1]
+        self.timeout = timeout
 
-        if isinstance(server, basestring):
+        if isinstance(server, string_types):
             self.resq = ResQ(server=server, password=password)
         elif isinstance(server, ResQ):
             self.resq = server
@@ -73,7 +75,7 @@ class Worker(object):
 
     def prune_dead_workers(self):
         all_workers = Worker.all(self.resq)
-        known_workers = self.worker_pids()
+        known_workers = Worker.worker_pids()
         for worker in all_workers:
             host, pid, queues = worker.id.split(':')
             if host != self.hostname:
@@ -111,6 +113,11 @@ class Worker(object):
             return self.id
         return '%s:%s:%s' % (self.hostname, self.pid, ','.join(self.queues))
 
+    def _setproctitle(self, msg):
+        setproctitle("pyres_worker-%s [%s]: %s" % (__version__,
+                                                   ','.join(self.queues),
+                                                   msg))
+
     def work(self, interval=5):
         """Invoked by ``run`` method. ``work`` listens on a list of queues and sleeps
         for ``interval`` time.
@@ -121,10 +128,9 @@ class Worker(object):
         that job to make sure another worker won't run it, then *forks* itself to
         work on that job.
 
-        Finally, the ``process`` method actually processes the job by eventually calling the Job instance's ``perform`` method.
-
         """
-        setproctitle('pyres_worker-%s: Starting' % __version__)
+        self._setproctitle("Starting")
+        logger.info("starting")
         self.startup()
 
         while True:
@@ -132,48 +138,94 @@ class Worker(object):
                 logger.info('shutdown scheduled')
                 break
 
+            self.register_worker()
+
             job = self.reserve(interval)
 
             if job:
-                logger.debug('picked up job')
-                logger.debug('job details: %s' % job)
-                self.before_fork(job)
-                self.child = os.fork() 
-                if self.child:
-                    setproctitle("pyres_worker%s: Forked %s at %s" %
-                                 (__version__,
-                                  self.child,
-                                  datetime.datetime.now()))
-                    logger.info('Forked %s at %s' % (self.child,
-                                                      datetime.datetime.now()))
-
-                    try:
-                        os.waitpid(self.child, 0)
-                    except OSError as ose:
-                        import errno
-
-                        if ose.errno != errno.EINTR:
-                            raise ose
-                    #os.wait()
-                    logger.debug('done waiting')
-                else:
-                    setproctitle("pyres_worker-%s: Processing %s since %s" %
-                                 (__version__, job._queue,
-                                  datetime.datetime.now()))
-                    logger.info('Processing %s since %s' %
-                                 (job._queue, datetime.datetime.now()))
-                    self.after_fork(job)
-                    self.process(job)
-                    os._exit(0)
-                self.child = None
+                self.fork_worker(job)
             else:
                 if interval == 0:
                     break
                 #procline @paused ? "Paused" : "Waiting for #{@queues.join(',')}"
-                setproctitle("pyres_worker-%s: Waiting for %s " %
-                             (__version__, ','.join(self.queues)))
+                self._setproctitle("Waiting")
                 #time.sleep(interval)
         self.unregister_worker()
+
+    def fork_worker(self, job):
+        """Invoked by ``work`` method. ``fork_worker`` does the actual forking to create the child
+        process that will process the job. It's also responsible for monitoring the child process
+        and handling hangs and crashes.
+
+        Finally, the ``process`` method actually processes the job by eventually calling the Job
+        instance's ``perform`` method.
+
+        """
+        logger.debug('picked up job')
+        logger.debug('job details: %s' % job)
+        self.before_fork(job)
+        self.child = os.fork()
+        if self.child:
+            self._setproctitle("Forked %s at %s" %
+                               (self.child,
+                                datetime.datetime.now()))
+            logger.info('Forked %s at %s' % (self.child,
+                                              datetime.datetime.now()))
+
+            try:
+                start = datetime.datetime.now()
+
+                # waits for the result or times out
+                while True:
+                    pid, status = os.waitpid(self.child, os.WNOHANG)
+                    if pid != 0:
+                        if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0:
+                            break
+                        if os.WIFSTOPPED(status):
+                            logger.warning("Process stopped by signal %d" % os.WSTOPSIG(status))
+                        else:
+                            if os.WIFSIGNALED(status):
+                                raise CrashError("Unexpected exit by signal %d" % os.WTERMSIG(status))
+                            raise CrashError("Unexpected exit status %d" % os.WEXITSTATUS(status))
+
+                    time.sleep(0.5)
+
+                    now = datetime.datetime.now()
+                    if self.timeout and ((now - start).seconds > self.timeout):
+                        os.kill(self.child, signal.SIGKILL)
+                        os.waitpid(-1, os.WNOHANG)
+                        raise TimeoutError("Timed out after %d seconds" % self.timeout)
+
+            except OSError as ose:
+                import errno
+
+                if ose.errno != errno.EINTR:
+                    raise ose
+            except JobError:
+                self._handle_job_exception(job)
+            finally:
+                # If the child process' job called os._exit manually we need to
+                # finish the clean up here.
+                if self.job():
+                    self.done_working(job)
+
+            logger.debug('done waiting')
+        else:
+            self._setproctitle("Processing %s since %s" %
+                               (job,
+                                datetime.datetime.now()))
+            logger.info('Processing %s since %s' %
+                         (job, datetime.datetime.now()))
+            self.after_fork(job)
+
+            # re-seed the Python PRNG after forking, otherwise
+            # all job process will share the same sequence of
+            # random numbers
+            random.seed()
+
+            self.process(job)
+            os._exit(0)
+        self.child = None
 
     def before_fork(self, job):
         """
@@ -195,28 +247,39 @@ class Worker(object):
     def process(self, job=None):
         if not job:
             job = self.reserve()
+
+        job_failed = False
         try:
-            self.working_on(job)
-            job = self.before_process(job)
-            return job.perform()
-        except Exception, e:
-            exceptionType, exceptionValue, exceptionTraceback = sys.exc_info()
-            logger.error("%s failed: %s" % (job, e))
-            job.fail(exceptionTraceback)
-            self.failed()
-        else:
-            logger.info('completed job')
-            logger.debug('job details: %s' % job)
+            try:
+                self.working_on(job)
+                job = self.before_process(job)
+                return job.perform()
+            except Exception:
+                job_failed = True
+                self._handle_job_exception(job)
+            except SystemExit as e:
+                if e.code != 0:
+                    job_failed = True
+                    self._handle_job_exception(job)
+
+            if not job_failed:
+                logger.debug('completed job')
+                logger.debug('job details: %s' % job)
         finally:
-            self.done_working()
+            self.done_working(job)
+
+    def _handle_job_exception(self, job):
+        exceptionType, exceptionValue, exceptionTraceback = sys.exc_info()
+        logger.exception("%s failed: %s" % (job, exceptionValue))
+        job.fail(exceptionTraceback)
+        self.failed()
 
     def reserve(self, timeout=10):
-        for q in self.queues:
-            logger.debug('checking queue %s' % q)
-            job = self.job_class.reserve(q, self.resq, self.__str__(), timeout=timeout)
-            if job:
-                logger.info('Found job on %s' % q)
-                return job
+        logger.debug('checking queues %s' % self.queues)
+        job = self.job_class.reserve(self.queues, self.resq, self.__str__(), timeout=timeout)
+        if job:
+            logger.info('Found job on %s: %s' % (job._queue, job))
+            return job
 
     def working_on(self, job):
         logger.debug('marking as working on')
@@ -230,8 +293,8 @@ class Worker(object):
         logger.debug("worker:%s" % str(self))
         logger.debug(self.resq.redis["resque:worker:%s" % str(self)])
 
-    def done_working(self):
-        logger.info('done working')
+    def done_working(self, job):
+        logger.debug('done working on %s', job)
         self.processed()
         self.resq.redis.delete("resque:worker:%s" % str(self))
 
@@ -266,16 +329,20 @@ class Worker(object):
             return 'working'
         return 'idle'
 
-    def worker_pids(self):
+    @classmethod
+    def worker_pids(cls):
         """Returns an array of all pids (as strings) of the workers on
         this machine.  Used when pruning dead workers."""
-        return map(lambda l: l.strip().split(' ')[0],
-                   commands.getoutput("ps -A -o pid,command | \
-                                       grep pyres_worker").split("\n"))
+        cmd = "ps -A -o pid,command | grep pyres_worker | grep -v grep"
+        output = commands.getoutput(cmd)
+        if output:
+            return map(lambda l: l.strip().split(' ')[0], output.split("\n"))
+        else:
+            return []
 
     @classmethod
-    def run(cls, queues, server="localhost:6379", interval=None):
-        worker = cls(queues=queues, server=server)
+    def run(cls, queues, server="localhost:6379", password=None, interval=None, timeout=None):
+        worker = cls(queues=queues, server=server, password=password, timeout=timeout)
         if interval is not None:
             worker.work(interval)
         else:
@@ -283,16 +350,16 @@ class Worker(object):
 
     @classmethod
     def all(cls, host="localhost:6379"):
-        if isinstance(host,basestring):
+        if isinstance(host,string_types):
             resq = ResQ(host)
         elif isinstance(host, ResQ):
             resq = host
 
-        return [Worker.find(w,resq) for w in resq.redis.smembers('resque:workers') or []]
+        return [Worker.find(w,resq) for w in resq.workers() or []]
 
     @classmethod
     def working(cls, host):
-        if isinstance(host, basestring):
+        if isinstance(host, string_types):
             resq = ResQ(host)
         elif isinstance(host, ResQ):
             resq = host
